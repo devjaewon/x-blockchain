@@ -1,0 +1,10 @@
+[package]
+name = "dip721-nft-container"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+keywords = ["internetcomputer", "dip721", "nft"]
+authors = ["devjaewon <jjazan201@gmail.com>"]
+
+[dependencies]
+ic-cdk = "0.7.4"
