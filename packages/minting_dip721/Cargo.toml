@@ -1,5 +1,5 @@
 [package]
-name = "minting"
+name = "minting_dip721"
 version = "0.1.0"
 edition = "2021"
 
