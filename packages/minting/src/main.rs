@@ -1,26 +1,24 @@
 #[macro_use]
 extern crate candid;
+#[macro_use]
+extern crate thiserror;
 
 use std::{
     env,
     process,
-    fs::{File},
-    path::{Path, PathBuf}, sync::Arc,
+    fs::{File, self},
+    path::{Path, PathBuf}, sync::Arc, collections::HashMap,
 };
 
 // https://docs.rs/anyhow/latest/anyhow/
 // Rust 에서 에러핸들링을 직관적인 결과로 받아 처리하기 쉽게 돕는 크레이트
-use anyhow::{anyhow, Result};
-
-// https://docs.rs/dialoguer/latest/dialoguer/
-// cli 환경에서의 사용자와 인터렉션을 돕는 라이브러리
-use dialoguer::Confirm;
+use anyhow::{anyhow, Result, Context, bail};
 
 // https://docs.rs/candid/latest/candid/
 // https://docs.rs/candid/latest/candid/types/principal/struct.Principal.html
 // icp 에서 개념화 한 일반 ID 타입이다. (향후 확장성을 고려하여 설계되었음)
 // 사용자 ID와 캐니스터 ID를 구분하지 않고 범용적으로 사용되며 0~29바이트의 불투명한 이진 blob이다.
-use candid::{Principal};
+use candid::Principal;
 
 // https://docs.rs/clap/latest/clap/
 // Command Line Argument Parser 의 약자로
@@ -28,7 +26,12 @@ use candid::{Principal};
 use clap::Parser;
 
 // https://docs.rs/ic-agent/latest/ic_agent/
-use ic_agent::{Agent, Identity, identity::{Secp256k1Identity, BasicIdentity}, agent::http_transport::ReqwestHttpReplicaV2Transport};
+use ic_agent::{Agent, Identity, identity::{Secp256k1Identity, BasicIdentity}, agent::http_transport::ReqwestHttpReplicaV2Transport, AgentError};
+
+use sha2::{Sha256, Digest};
+use types::*;
+
+mod types;
 
 #[derive(Parser)]
 struct Args {
@@ -39,7 +42,7 @@ struct Args {
     owner: Principal,
     // smart contract에 보낼 파일경로
     #[clap(long)]
-    file: Option<PathBuf>,
+    file: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -60,18 +63,63 @@ async fn main() {
 async fn rmain() -> Result<()> {
     let args = Args::parse();
 
-    if args.file.is_none()
-        && !Confirm::new()
-            .with_prompt("정말로 업로드 대상이 되는 file 인자가 없습니까?")
-            .interact()? // ? 는 result 값을 바로 불러오며, 에러 시에 바로 From::from 값을 이용해 변환하는 연산자이다.
-    {
-        println!("file 인자를 설정하여 다시 실행해주세요.");
-        return Ok(());
-    }
-
     let canister = args.canister;
     let owner = args.owner;
+    let file = args.file;
+
     let agent = get_agent().await?;
+
+    // DIP-721을 지원하고 있는지 확인하기
+    let res = agent
+        .query(&canister, "supportedInterfacesDip721")
+        .with_arg(Encode!()?)
+        .call()
+        .await;
+    let res = if let Err(AgentError::ReplicaError { reject_code: 3, .. }) = &res {
+        res.context(format!(
+            "canister {canister} does not appear to be a DIP-721 NFT canister"
+        ))?
+    } else {
+        res?
+    };
+    let interfaces = Decode!(&res, Vec<InterfaceId>)?;
+    if !interfaces.contains(&InterfaceId::Mint) {
+        bail!("canister {canister} does not support minting");
+    }
+
+    // Agent 인터페이스에 맞는 민팅 Payload 생성
+    let mut metadata = HashMap::new();
+    metadata.insert("locationType", MetadataVal::Nat8Content(4));
+
+    let data = fs::read(&file)?;
+    metadata.insert("contentHash", MetadataVal::BlobContent(Vec::from_iter(Sha256::digest(&data))));
+
+    let content_type = mime_guess::from_path(&file).first().map(|m| format!("{m}"));
+    let content_type = content_type.unwrap_or_else(|| String::from("application/octet-stream"));
+    metadata.insert("contentType", MetadataVal::TextContent(content_type));
+
+    let metadata_part = MetadataPart {
+        purpose: MetadataPurpose::Rendered,
+        data: &data,
+        key_val_data: metadata,
+    };
+
+    // 민팅 요청 보내기
+    let res = agent
+        .update(&canister, "mintDip721")
+        .with_arg(Encode!(&owner, &[metadata_part], &data)?)
+        .call_and_wait()
+        .await;
+
+    let res = if let Err(AgentError::ReplicaError { reject_code: 3, .. }) = &res {
+        res.context(format!("canister {canister} does not support minting"))?
+    } else {
+        res?
+    };
+
+    let MintReceipt { token_id, id } = Decode!(&res, Result<MintReceipt, MintError>)??;
+
+    println!("Successfully minted token {token_id} to {owner} (transaction id {id})");
 
     return Ok(());
 }
